@@ -56,7 +56,7 @@ bu.load_preflop()          # load the preflop table at startup (fast, ~1 MB)
 _TABLE = get_table()
 
 # --- tunables ---------------------------------------------------------------
-TIME_BUDGET = 4.0          # seconds of our own compute per half (bank is 8 s)
+TIME_BUDGET = 5.5          # seconds of our own compute per half (bank is 8 s)
 MAX_DECISION_TIME = 0.012  # never spend more than this on one decision
 MIN_TRIALS = 24
 MAX_TRIALS = 400
@@ -66,6 +66,29 @@ MAX_TRIALS = 400
 _CAT_WEIGHT = (0.30, 0.45, 0.70, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
 
 RAISES = (Action.RAISE_HALF, Action.RAISE_POT)
+
+# Strategy settings (tuned offline with scripts/league.py).
+P = {
+    "open_pct": 0.40,          # button opens (raises) hands above this percentile
+    "open_pct_vs_folder": 0.30,  # ... and wider vs opponents who fold a lot
+    "limp_pct": 0.12,          # button calls (limps) above this percentile
+    "bb_raise_pct": 0.65,      # big blind raises a limp above this percentile
+    "pf_reraise_eq": 0.6,     # re-raise preflop with this equity vs range
+    "pf_call_margin": 0.09,    # extra equity needed to call a preflop raise
+    "bet_pot_eq": 0.62,        # bet pot with this equity when checked to
+    "bet_half_eq": 0.52,       # bet half pot with this equity
+    "bet_half_eq_station": 0.55,  # ... vs opponents who rarely fold
+    "ip_bonus": 0.03,           # lower betting thresholds by this in position
+    "bluff_fold_thresh": 0.45, # only bluff vs fold-to-raise above this
+    "bluff_base": 0.15,        # base bluff frequency
+    "raise_eq_hi": 0.85,       # always raise a bet with this equity
+    "raise_eq": 0.75,          # raise a bet with this equity (early in the street)
+    "call_margin": 0.1,       # extra equity needed to call before the river
+    "river_call_margin": 0.05,  # extra equity needed to call on the river
+    "check_strong_keep": 1.0,  # after opp checks, keep its strong hands with this prob
+    "time_budget": TIME_BUDGET,  # seconds of our own compute per half
+    "steal_ftr": 0.80,         # vs opponents folding this often to raises: raise everything
+}
 
 
 def _clamp(x, lo, hi):
@@ -109,12 +132,21 @@ def _opp_range(obs, memory):
     return thresh, post_k * sig_post
 
 
+def _opp_checked(obs):
+    """True if the opponent checked on this street (a sign of a weaker hand)."""
+    for a in obs.action_history:
+        if a.street == obs.street and not a.is_me and a.action == Action.CHECK_CALL and a.amount == 0:
+            return True
+    return False
+
+
 # --- equity -----------------------------------------------------------------
 
 def _equity(obs, memory, allowance):
     """Monte Carlo equity vs the modelled opponent range, cached per situation."""
     thresh, post_w = _opp_range(obs, memory)
-    key = (obs.hand_index, len(obs.board), thresh, round(post_w, 2))
+    chk_keep = P["check_strong_keep"] if (obs.street != Street.PREFLOP and _opp_checked(obs)) else 1.0
+    key = (obs.hand_index, len(obs.board), thresh, round(post_w, 2), chk_keep)
     cache = memory["eq_cache"]
     if key in cache:
         return cache[key]
@@ -134,7 +166,7 @@ def _equity(obs, memory, allowance):
     river_tri = vis_tri if need == 0 else None
     my_river = max([table[h | b] for h in mine for b in river_tri]) if river_tri else 0
     filter_pre = pre is not None and thresh > 0
-    filter_post = vis_tri is not None and post_w > 0.01
+    filter_post = vis_tri is not None and (post_w > 0.01 or chk_keep < 1.0)
     hidx = bu.hand_index
     triples5 = bu.TRIPLES5
     pairs5 = bu.PAIRS5
@@ -157,6 +189,8 @@ def _equity(obs, memory, allowance):
                 cat = max([table[h | b] for h in om for b in vis_tri]) >> 20
                 if rnd() > _CAT_WEIGHT[cat] ** post_w:
                     continue
+                if cat >= 3 and chk_keep < 1.0 and rnd() > chk_keep:
+                    continue
             break
         ob = [1 << c for c in opp]
         om = [ob[i] | ob[j] for i, j in pairs5]
@@ -177,7 +211,7 @@ def _equity(obs, memory, allowance):
 
 def _allowance(obs, memory):
     """Seconds we may spend on this decision, from what is left of our budget."""
-    left = TIME_BUDGET - memory["t_used"]
+    left = P["time_budget"] - memory["t_used"]
     hands_left = max(1, memory["num_hands"] - obs.hand_index)
     dph = max(1.2, memory["decisions"] / max(1, obs.hand_index + 1))
     per = left / (hands_left * dph)
@@ -206,15 +240,18 @@ def _preflop(obs, memory, allowance):
     opp_raised = any((not a.is_me) and a.action in RAISES for a in obs.action_history)
     _, _, _, fold_to_raise, _, _ = _stats(memory)
 
+    steal = fold_to_raise >= P["steal_ftr"] and memory["stats"]["faced_raise"] >= 20
     if not opp_raised:
+        if steal:
+            return _pick(obs, Action.RAISE_POT, Action.CHECK_CALL)
         if obs.to_call > 0:
             # Button, first to act (only the blinds are in).
-            open_pct = 0.40 if fold_to_raise < 0.5 else 0.30
+            open_pct = P["open_pct"] if fold_to_raise < 0.5 else P["open_pct_vs_folder"]
             if pct >= open_pct:
                 return _pick(obs, Action.RAISE_POT)
-            return _call_or_fold(obs, pct >= 0.12)
+            return _call_or_fold(obs, pct >= P["limp_pct"])
         # Big blind after a limp: raise good hands, check the rest.
-        if pct >= 0.65:
+        if pct >= P["bb_raise_pct"]:
             return _pick(obs, Action.RAISE_POT)
         return Action.CHECK_CALL
 
@@ -224,9 +261,9 @@ def _preflop(obs, memory, allowance):
     else:
         eq = pf_eq - 0.03
     odds = obs.to_call / (obs.pot + obs.to_call)
-    if eq >= 0.56 and obs.raises_this_street < 4:
+    if eq >= P["pf_reraise_eq"] and obs.raises_this_street < 4:
         return _pick(obs, Action.RAISE_POT, Action.CHECK_CALL)
-    margin = 0.0 if obs.my_stack <= obs.to_call else 0.04
+    margin = 0.0 if obs.my_stack <= obs.to_call else P["pf_call_margin"]
     return _call_or_fold(obs, eq >= odds + margin)
 
 
@@ -240,13 +277,16 @@ def _postflop(obs, memory, allowance):
     river = obs.street == Street.RIVER
 
     if obs.to_call == 0:
-        if eq >= 0.72:
+        ip = P["ip_bonus"] if obs.is_button else 0.0
+        if eq >= P["bet_pot_eq"] - ip:
             return _pick(obs, Action.RAISE_POT)
-        if eq >= 0.60 or (eq >= 0.55 and fold_to_raise < 0.3):
+        if eq >= P["bet_half_eq"] - ip or (eq >= P["bet_half_eq_station"] - ip and fold_to_raise < 0.3):
+            return _pick(obs, Action.RAISE_HALF)
+        if fold_to_raise >= P["steal_ftr"] and memory["stats"]["faced_raise"] >= 20:
             return _pick(obs, Action.RAISE_HALF)
         # Bluff / semi-bluff only against opponents who fold enough.
-        if fold_to_raise > 0.45:
-            p = 0.15 + (fold_to_raise - 0.45)
+        if fold_to_raise > P["bluff_fold_thresh"]:
+            p = P["bluff_base"] + (fold_to_raise - P["bluff_fold_thresh"])
             if (not river and eq >= 0.40) or eq < 0.25:
                 if rng.random() < p:
                     return _pick(obs, Action.RAISE_HALF)
@@ -254,9 +294,12 @@ def _postflop(obs, memory, allowance):
 
     odds = obs.to_call / (obs.pot + obs.to_call)
     all_in_call = obs.my_stack <= obs.to_call
-    if eq >= 0.80 or (eq >= 0.70 and obs.raises_this_street < 2):
+    if eq >= P["raise_eq_hi"] or (eq >= P["raise_eq"] and obs.raises_this_street < 2):
         return _pick(obs, Action.RAISE_POT, Action.CHECK_CALL)
-    margin = 0.0 if (river or all_in_call) else 0.04
+    if all_in_call:
+        margin = 0.0
+    else:
+        margin = P["river_call_margin"] if river else P["call_margin"]
     return _call_or_fold(obs, eq >= odds + margin)
 
 
