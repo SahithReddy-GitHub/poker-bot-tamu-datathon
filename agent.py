@@ -39,72 +39,312 @@ from game import Action, AgentConfig, HandResult, Observation, Street
 warmup()
 
 # rename as your team/bot's name
-PARTICIPANT = "TotallyAwesomeDatathonParticipant"
-AGENT_NAME = "JustAsAwesomeAgent"
+PARTICIPANT = "Sahith Reddy Challarapu"
+AGENT_NAME = "RangeEquityBot"
 
 
 # ===== YOUR CODE HERE =====
 
+import random
+import time
+from bisect import bisect_left
+
+import bot_utils as bu
+from evaluator import get_table
+
+bu.load_preflop()          # load the preflop table at startup (fast, ~1 MB)
+_TABLE = get_table()
+
+# --- tunables ---------------------------------------------------------------
+TIME_BUDGET = 4.0          # seconds of our own compute per half (bank is 8 s)
+MAX_DECISION_TIME = 0.012  # never spend more than this on one decision
+MIN_TRIALS = 24
+MAX_TRIALS = 400
+
+# Chance an opponent bets/raises with a hand of each made-hand category,
+# relative to a straight-or-better (used to narrow its range postflop).
+_CAT_WEIGHT = (0.30, 0.45, 0.70, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+
+RAISES = (Action.RAISE_HALF, Action.RAISE_POT)
+
+
+def _clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+
+# --- opponent model ---------------------------------------------------------
+
+def _stats(memory):
+    s = memory["stats"]
+    pf_raise = (s["pf_raise"] + 6) / (s["pf_act"] + 20)          # prior 0.30
+    pf_cont = (s["pf_cont"] + 14) / (s["pf_act"] + 20)            # prior 0.70
+    post_raise = (s["post_raise"] + 6) / (s["post_act"] + 20)     # prior 0.30
+    fold_to_raise = (s["fold_vs_raise"] + 4) / (s["faced_raise"] + 10)  # prior 0.40
+    # How much the opponent's raises actually mean strength (1 = tight, 0 = random).
+    sig_pre = _clamp((0.70 - pf_raise) / 0.45, 0.0, 1.0)
+    sig_post = _clamp((0.70 - post_raise) / 0.45, 0.0, 1.0)
+    return pf_raise, pf_cont, post_raise, fold_to_raise, sig_pre, sig_post
+
+
+def _opp_range(obs, memory):
+    """(preflop raw threshold, postflop aggression weight) for the opponent's range."""
+    pf_raise, pf_cont, _, _, sig_pre, sig_post = _stats(memory)
+    keep = 1.0
+    post_k = 0.0
+    for a in obs.action_history:
+        if a.is_me:
+            continue
+        if a.street == Street.PREFLOP:
+            if a.action in RAISES:
+                keep *= 1.0 - sig_pre * (1.0 - _clamp(pf_raise, 0.12, 1.0))
+            elif a.action == Action.CHECK_CALL and a.amount > 0:
+                keep *= 1.0 - 0.5 * sig_pre * (1.0 - _clamp(pf_cont, 0.3, 1.0))
+        else:
+            if a.action in RAISES:
+                post_k += 1.0
+            elif a.action == Action.CHECK_CALL and a.amount > 0:
+                post_k += 0.4
+    keep = _clamp(keep, 0.06, 1.0)
+    thresh = bu.preflop_raw_threshold(1.0 - keep) if keep < 0.999 else 0
+    return thresh, post_k * sig_post
+
+
+# --- equity -----------------------------------------------------------------
+
+def _equity(obs, memory, allowance):
+    """Monte Carlo equity vs the modelled opponent range, cached per situation."""
+    thresh, post_w = _opp_range(obs, memory)
+    key = (obs.hand_index, len(obs.board), thresh, round(post_w, 2))
+    cache = memory["eq_cache"]
+    if key in cache:
+        return cache[key]
+
+    deadline = time.perf_counter() + allowance
+    rng = memory["rng"]
+    table = _TABLE
+    pre = bu._PREFLOP
+    hole = list(obs.hole_cards)
+    board = list(obs.board)
+    used = set(hole) | set(board)
+    rest = [c for c in range(36) if c not in used]
+    need = 5 - len(board)
+    mine = bu.hole_pair_masks(hole)
+    board_bits = [1 << c for c in board]
+    vis_tri = bu.board_triple_masks(board) if len(board) >= 3 else None
+    river_tri = vis_tri if need == 0 else None
+    my_river = max([table[h | b] for h in mine for b in river_tri]) if river_tri else 0
+    filter_pre = pre is not None and thresh > 0
+    filter_post = vis_tri is not None and post_w > 0.01
+    hidx = bu.hand_index
+    triples5 = bu.TRIPLES5
+    pairs5 = bu.PAIRS5
+    sample = rng.sample
+    rnd = rng.random
+
+    wins = 0.0
+    n = 0
+    while n < MAX_TRIALS:
+        if n >= MIN_TRIALS and (n & 7) == 0 and time.perf_counter() > deadline:
+            break
+        for _ in range(40):  # rejection-sample an opponent hand from its range
+            s = sample(rest, 5 + need)
+            opp = s[:5]
+            if filter_pre and pre[hidx(opp)] < thresh:
+                continue
+            if filter_post:
+                ob = [1 << c for c in opp]
+                om = [ob[i] | ob[j] for i, j in pairs5]
+                cat = max([table[h | b] for h in om for b in vis_tri]) >> 20
+                if rnd() > _CAT_WEIGHT[cat] ** post_w:
+                    continue
+            break
+        ob = [1 << c for c in opp]
+        om = [ob[i] | ob[j] for i, j in pairs5]
+        if need:
+            bits = board_bits + [1 << c for c in s[5:]]
+            tri = [bits[i] | bits[j] | bits[k] for i, j, k in triples5]
+            a = max([table[h | b] for h in mine for b in tri])
+        else:
+            tri = river_tri
+            a = my_river
+        o = max([table[h | b] for h in om for b in tri])
+        wins += 1.0 if a > o else 0.5 if a == o else 0.0
+        n += 1
+    eq = wins / n if n else 0.5
+    cache[key] = eq
+    return eq
+
+
+def _allowance(obs, memory):
+    """Seconds we may spend on this decision, from what is left of our budget."""
+    left = TIME_BUDGET - memory["t_used"]
+    hands_left = max(1, memory["num_hands"] - obs.hand_index)
+    dph = max(1.2, memory["decisions"] / max(1, obs.hand_index + 1))
+    per = left / (hands_left * dph)
+    return _clamp(per, 0.0, MAX_DECISION_TIME)
+
+
+# --- decisions --------------------------------------------------------------
+
+def _pick(obs, *prefs):
+    """First preferred action that is legal; else check/call."""
+    for a in prefs:
+        if a in obs.legal_actions:
+            return a
+    return Action.CHECK_CALL
+
+
+def _call_or_fold(obs, ok):
+    if obs.to_call == 0:
+        return Action.CHECK_CALL
+    return Action.CHECK_CALL if ok else _pick(obs, Action.FOLD)
+
+
+def _preflop(obs, memory, allowance):
+    pf_eq = bu.preflop_equity(obs.hole_cards)
+    pct = bisect_left(bu._SORTED_EQ, int(pf_eq * 65535)) / len(bu._SORTED_EQ) if bu._SORTED_EQ else 0.5
+    opp_raised = any((not a.is_me) and a.action in RAISES for a in obs.action_history)
+    _, _, _, fold_to_raise, _, _ = _stats(memory)
+
+    if not opp_raised:
+        if obs.to_call > 0:
+            # Button, first to act (only the blinds are in).
+            open_pct = 0.40 if fold_to_raise < 0.5 else 0.30
+            if pct >= open_pct:
+                return _pick(obs, Action.RAISE_POT)
+            return _call_or_fold(obs, pct >= 0.12)
+        # Big blind after a limp: raise good hands, check the rest.
+        if pct >= 0.65:
+            return _pick(obs, Action.RAISE_POT)
+        return Action.CHECK_CALL
+
+    # Facing a raise: compare equity vs the opponent's range to the price.
+    if allowance > 0.0004:
+        eq = _equity(obs, memory, allowance)
+    else:
+        eq = pf_eq - 0.03
+    odds = obs.to_call / (obs.pot + obs.to_call)
+    if eq >= 0.56 and obs.raises_this_street < 4:
+        return _pick(obs, Action.RAISE_POT, Action.CHECK_CALL)
+    margin = 0.0 if obs.my_stack <= obs.to_call else 0.04
+    return _call_or_fold(obs, eq >= odds + margin)
+
+
+def _postflop(obs, memory, allowance):
+    if allowance > 0.0004:
+        eq = _equity(obs, memory, allowance)
+    else:  # out of time: crude made-hand strength
+        eq = 0.15 + 0.12 * (bu.made_score(obs.hole_cards, obs.board) >> 20)
+    _, _, _, fold_to_raise, _, _ = _stats(memory)
+    rng = memory["rng"]
+    river = obs.street == Street.RIVER
+
+    if obs.to_call == 0:
+        if eq >= 0.72:
+            return _pick(obs, Action.RAISE_POT)
+        if eq >= 0.60 or (eq >= 0.55 and fold_to_raise < 0.3):
+            return _pick(obs, Action.RAISE_HALF)
+        # Bluff / semi-bluff only against opponents who fold enough.
+        if fold_to_raise > 0.45:
+            p = 0.15 + (fold_to_raise - 0.45)
+            if (not river and eq >= 0.40) or eq < 0.25:
+                if rng.random() < p:
+                    return _pick(obs, Action.RAISE_HALF)
+        return Action.CHECK_CALL
+
+    odds = obs.to_call / (obs.pot + obs.to_call)
+    all_in_call = obs.my_stack <= obs.to_call
+    if eq >= 0.80 or (eq >= 0.70 and obs.raises_this_street < 2):
+        return _pick(obs, Action.RAISE_POT, Action.CHECK_CALL)
+    margin = 0.0 if (river or all_in_call) else 0.04
+    return _call_or_fold(obs, eq >= odds + margin)
+
+
 def new_half(config: AgentConfig, memory: dict) -> None:
-    """Called at the start of each half-match (1000 hands).
+    memory["num_hands"] = getattr(config, "num_hands", 1000) or 1000
+    memory["t_used"] = 0.0
+    memory["decisions"] = 0
+    memory["rng"] = random.Random(20261107)
+    memory["eq_cache"] = {}
+    memory["cur"] = None  # (hand_index, last history seen, my last action)
+    memory["stats"] = {k: 0 for k in (
+        "pf_act", "pf_raise", "pf_cont", "post_act", "post_raise",
+        "faced_raise", "fold_vs_raise")}
 
-    `memory` is a fresh, empty dict every half. Store anything you want to
-    remember between hands in it, e.g. memory["opp_raises"] = 0.
-    `config` holds the match settings (starting_stack, big_blind, ...).
 
-    In the tournament, each half runs in a brand-new copy of your server,
-    so nothing you learn in one half carries over to the other half.
-    """
-    memory["hands_played"] = 0
+def _safe_default(obs):
+    if Action.CHECK_CALL in obs.legal_actions and (obs.to_call == 0 or Action.FOLD not in obs.legal_actions):
+        return Action.CHECK_CALL
+    return Action.FOLD if Action.FOLD in obs.legal_actions else obs.legal_actions[0]
 
 
 def choose_action(obs: Observation, memory: dict) -> Action:
-    """Called every time it is your turn. Return one of obs.legal_actions.
-
-    What you can see in obs:
-        hand_index          which hand of the half this is (0, 1, 2, ...)
-        street              Street.PREFLOP, Street.FLOP, Street.TURN or Street.RIVER
-        hole_cards          your 5 cards as ints, sorted ascending (0-35)
-        board               board (community) cards seen so far (0, 3, 4 or 5 ints)
-        pot                 total chips both players put in this hand
-        to_call             chips you must add to match the opponent
-        my_bet, opp_bet     chips you,opponent put in on THIS street
-        my_stack, opp_stack chips each player still has behind
-        is_button           True if you are the button (small blind)
-        legal_actions       the Actions you may return right now
-        raise_to            {RAISE_HALF: total, RAISE_POT: total} for legal raises
-        min_raise_to        smallest normal raise total (all-ins may be lower)
-        raises_this_street  raises so far this street (max 4)
-        action_history      this hand's actions so far; each has
-                            street, is_me, action, amount, street_total
-        big_blind           size of the big blind in chips
-
-    Actions: Action.FOLD, Action.CHECK_CALL, Action.RAISE_HALF, Action.RAISE_POT
-    Cards are ints: card_rank(c) is 0 (six) .. 8 (ace), card_suit(c) is 0..3,
-    and cards_to_str(obs.hole_cards) prints them like "6h 7c 9s Kd Ah".
-    Once all 5 board cards are out, omaha_score(obs.hole_cards, obs.board)
-    scores your hand (higher is better).
-    """
-
-    # Simple example of a heuristic bot, which just checks when it is of no cost, otherwise folds
-    # Replace this with your strategy!
-    if obs.to_call == 0:
-        return Action.CHECK_CALL
-    return Action.FOLD
+    t0 = time.perf_counter()
+    action = None
+    try:
+        if "stats" not in memory:
+            new_half(AgentConfig(), memory)
+        if len(memory["eq_cache"]) > 64:
+            memory["eq_cache"].clear()
+        allowance = _allowance(obs, memory)
+        if obs.street == Street.PREFLOP:
+            action = _preflop(obs, memory, allowance)
+        else:
+            action = _postflop(obs, memory, allowance)
+        memory["cur"] = (obs.hand_index, obs.action_history, action, obs.street)
+    except Exception:
+        action = None
+    if action not in obs.legal_actions:
+        action = _safe_default(obs)
+    try:
+        memory["decisions"] += 1
+        memory["t_used"] += time.perf_counter() - t0
+    except Exception:
+        pass
+    return action
 
 
 def on_hand_end(result: HandResult, memory: dict) -> None:
-    """Called once for every finished hand. Optional: learn from what happened.
-
-    To save time, the judge sends finished hands along with your next
-    decision request, so this always runs BEFORE choose_action() sees the
-    next hand. (The last hands of a half arrive at the end of the half.)
-
-    result has: hand_index, my_net (chips won or lost), pot,
-    went_to_showdown, board (cards revealed), opp_hole (opponent's cards,
-    only after a showdown, else None), winner ('me', 'opp' or 'split').
-    """
-    memory["hands_played"] += 1
+    t0 = time.perf_counter()
+    try:
+        s = memory["stats"]
+        cur = memory.get("cur")
+        if cur is None or cur[0] != result.hand_index:
+            # We never acted: the button folded straight away.
+            if not result.went_to_showdown and result.my_net > 0:
+                s["pf_act"] += 1
+            return
+        _, history, my_last, my_street = cur
+        prev_mine = None
+        for a in history:
+            if a.is_me:
+                prev_mine = a.action
+                continue
+            pre = a.street == Street.PREFLOP
+            s["pf_act" if pre else "post_act"] += 1
+            if a.action in RAISES:
+                s["pf_raise" if pre else "post_raise"] += 1
+            if pre and a.action != Action.FOLD:
+                s["pf_cont"] += 1
+            if prev_mine in RAISES:
+                s["faced_raise"] += 1
+            prev_mine = None
+        # The opponent's response to our last action, which we never saw.
+        if my_last in RAISES:
+            s["faced_raise"] += 1
+            key = "pf_act" if my_street == Street.PREFLOP else "post_act"
+            s[key] += 1
+            if not result.went_to_showdown and result.my_net > 0:
+                s["fold_vs_raise"] += 1
+            elif my_street == Street.PREFLOP:
+                s["pf_cont"] += 1
+    except Exception:
+        pass
+    finally:
+        try:
+            memory["t_used"] += time.perf_counter() - t0
+        except Exception:
+            pass
 
 # ===== END OF YOUR CODE =====
 
