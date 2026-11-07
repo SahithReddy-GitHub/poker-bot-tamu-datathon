@@ -40,7 +40,7 @@ warmup()
 
 # rename as your team/bot's name
 PARTICIPANT = "Royal Flush"
-AGENT_NAME = "RangeEquityBot"
+AGENT_NAME = "RangeEquityBot-v3"
 
 
 # ===== YOUR CODE HERE =====
@@ -88,7 +88,26 @@ P = {
     "check_strong_keep": 1.0,  # after opp checks, keep its strong hands with this prob
     "time_budget": TIME_BUDGET,  # seconds of our own compute per half
     "steal_ftr": 0.80,         # vs opponents folding this often to raises: raise everything
+    "max_trials_fast": 3000,   # cap on numpy simulations per decision
+    "use_ev_bluff": 1,         # bluff whenever the expected value says it pays
+    "fold_prior": 0.2,        # assumed fold rate before we have data
+    "called_eq_factor": 0.6,  # our equity is lower when a bet gets called
+    "bluff_ev_margin": 0.06,   # bluff only if it beats checking by this share of the pot
+    "raise_fold_discount": 0.5,  # opponents fold less to a raise after betting
+    "sd_prior": 6,             # showdowns needed before trusting showdown stats half-way
 }
+
+try:
+    import numpy as _np
+    import fast_equity as _fe
+    _FAST = _fe.init(_CAT_WEIGHT)
+except Exception:
+    _FAST = False
+
+# Share of random hands that are "weak" on each street (flop / turn / river),
+# and the made-hand category at or below which a hand counts as weak.
+_WEAK_CUT = {3: 1, 4: 2, 5: 3}
+_WEAK_BASE = {3: 0.373, 4: 0.452, 5: 0.517}
 
 
 def _clamp(x, lo, hi):
@@ -106,6 +125,16 @@ def _stats(memory):
     # How much the opponent's raises actually mean strength (1 = tight, 0 = random).
     sig_pre = _clamp((0.70 - pf_raise) / 0.45, 0.0, 1.0)
     sig_post = _clamp((0.70 - post_raise) / 0.45, 0.0, 1.0)
+    # Showdowns tell us what the opponent really had when it raised.
+    k = P["sd_prior"]
+    n = s["sd_post_n"]
+    if n:
+        emp = _clamp(1.0 - s["sd_post_weak"] / max(1e-9, s["sd_post_base"]), 0.0, 1.0)
+        sig_post = (n * emp + k * sig_post) / (n + k)
+    n = s["sd_pf_n"]
+    if n:
+        emp = _clamp((s["sd_pf_pct"] / n - 0.5) / 0.4, 0.0, 1.0)
+        sig_pre = (n * emp + k * sig_pre) / (n + k)
     return pf_raise, pf_cont, post_raise, fold_to_raise, sig_pre, sig_post
 
 
@@ -150,6 +179,15 @@ def _equity(obs, memory, allowance):
     cache = memory["eq_cache"]
     if key in cache:
         return cache[key]
+
+    if _FAST:
+        t0 = time.perf_counter()
+        n = int(_clamp((allowance - 0.00015) / memory["tpt"], 150, P["max_trials_fast"]))
+        eq = _fe.equity(obs.hole_cards, obs.board, n, memory["nprng"], thresh, post_w, chk_keep)
+        dt = time.perf_counter() - t0
+        memory["tpt"] = 0.8 * memory["tpt"] + 0.2 * max(2e-7, dt / n)
+        cache[key] = eq
+        return eq
 
     deadline = time.perf_counter() + allowance
     rng = memory["rng"]
@@ -234,6 +272,47 @@ def _call_or_fold(obs, ok):
     return Action.CHECK_CALL if ok else _pick(obs, Action.FOLD)
 
 
+def _fold_prob(memory, street):
+    """How often the opponent folds to our bet/raise on this street."""
+    s = memory["stats"]
+    overall = (s["fold_vs_raise"] + 4 * P["fold_prior"]) / (s["faced_raise"] + 4)
+    return (s["fold_s"][street] + 6 * overall) / (s["faced_s"][street] + 6)
+
+
+def _ev_bet(obs, memory, eq):
+    """Best bet size when checked to, if betting beats checking in expectation."""
+    f = _fold_prob(memory, int(obs.street))
+    ec = eq * P["called_eq_factor"]
+    river = obs.street == Street.RIVER
+    real = 1.0 if river else (0.85 if obs.is_button else 0.75)
+    best, best_ev = None, eq * obs.pot * real + P["bluff_ev_margin"] * obs.pot
+    for a in RAISES:
+        if a in obs.raise_to:
+            b = obs.raise_to[a] - obs.my_bet
+            ev = f * obs.pot + (1 - f) * (ec * (obs.pot + 2 * b) - b)
+            if ev > best_ev:
+                best, best_ev = a, ev
+    return best
+
+
+def _ev_raise(obs, memory, eq, call_ok):
+    """Bluff-raise a bet if that beats calling/folding in expectation."""
+    f = _fold_prob(memory, int(obs.street)) * P["raise_fold_discount"]
+    ec = eq * P["called_eq_factor"] * 0.85
+    river = obs.street == Street.RIVER
+    real = 1.0 if river else 0.8
+    ev_call = eq * (obs.pot + obs.to_call) * real - obs.to_call if call_ok else 0.0
+    best, best_ev = None, max(0.0, ev_call) + P["bluff_ev_margin"] * obs.pot
+    for a in RAISES:
+        if a in obs.raise_to:
+            add = obs.raise_to[a] - obs.my_bet
+            final = obs.pot + add + (obs.raise_to[a] - obs.opp_bet)
+            ev = f * obs.pot + (1 - f) * (ec * final - add)
+            if ev > best_ev:
+                best, best_ev = a, ev
+    return best
+
+
 def _preflop(obs, memory, allowance):
     pf_eq = bu.preflop_equity(obs.hole_cards)
     pct = bisect_left(bu._SORTED_EQ, int(pf_eq * 65535)) / len(bu._SORTED_EQ) if bu._SORTED_EQ else 0.5
@@ -284,6 +363,9 @@ def _postflop(obs, memory, allowance):
             return _pick(obs, Action.RAISE_HALF)
         if fold_to_raise >= P["steal_ftr"] and memory["stats"]["faced_raise"] >= 20:
             return _pick(obs, Action.RAISE_HALF)
+        if P["use_ev_bluff"]:
+            a = _ev_bet(obs, memory, eq)
+            return a if a in obs.legal_actions else Action.CHECK_CALL
         # Bluff / semi-bluff only against opponents who fold enough.
         if fold_to_raise > P["bluff_fold_thresh"]:
             p = P["bluff_base"] + (fold_to_raise - P["bluff_fold_thresh"])
@@ -300,7 +382,12 @@ def _postflop(obs, memory, allowance):
         margin = 0.0
     else:
         margin = P["river_call_margin"] if river else P["call_margin"]
-    return _call_or_fold(obs, eq >= odds + margin)
+    call_ok = eq >= odds + margin
+    if P["use_ev_bluff"] and obs.raises_this_street < 3:
+        a = _ev_raise(obs, memory, eq, call_ok)
+        if a in obs.legal_actions:
+            return a
+    return _call_or_fold(obs, call_ok)
 
 
 def new_half(config: AgentConfig, memory: dict) -> None:
@@ -312,7 +399,13 @@ def new_half(config: AgentConfig, memory: dict) -> None:
     memory["cur"] = None  # (hand_index, last history seen, my last action)
     memory["stats"] = {k: 0 for k in (
         "pf_act", "pf_raise", "pf_cont", "post_act", "post_raise",
-        "faced_raise", "fold_vs_raise")}
+        "faced_raise", "fold_vs_raise", "sd_post_n", "sd_post_weak", "sd_pf_n", "sd_pf_pct")}
+    memory["stats"]["sd_post_base"] = 0.0
+    memory["stats"]["faced_s"] = [0, 0, 0, 0]   # our raises the opponent faced, per street
+    memory["stats"]["fold_s"] = [0, 0, 0, 0]    # ... and folded to
+    memory["tpt"] = 1e-6                        # seconds per numpy simulation (measured)
+    if _FAST:
+        memory["nprng"] = _np.random.default_rng(20261107)
 
 
 def _safe_default(obs):
@@ -371,16 +464,38 @@ def on_hand_end(result: HandResult, memory: dict) -> None:
                 s["pf_cont"] += 1
             if prev_mine in RAISES:
                 s["faced_raise"] += 1
+                s["faced_s"][int(a.street)] += 1
             prev_mine = None
         # The opponent's response to our last action, which we never saw.
         if my_last in RAISES:
             s["faced_raise"] += 1
+            s["faced_s"][int(my_street)] += 1
             key = "pf_act" if my_street == Street.PREFLOP else "post_act"
             s[key] += 1
             if not result.went_to_showdown and result.my_net > 0:
                 s["fold_vs_raise"] += 1
+                s["fold_s"][int(my_street)] += 1
             elif my_street == Street.PREFLOP:
                 s["pf_cont"] += 1
+        # Showdown: how strong was the opponent when it raised?
+        if result.went_to_showdown and result.opp_hole and len(result.board) == 5:
+            opp = list(result.opp_hole)
+            pf_counted = False
+            for a in history:
+                if a.is_me or a.action not in RAISES:
+                    continue
+                if a.street == Street.PREFLOP:
+                    if not pf_counted:
+                        raw = int(bu.preflop_equity(opp) * 65535)
+                        s["sd_pf_n"] += 1
+                        s["sd_pf_pct"] += bisect_left(bu._SORTED_EQ, raw) / len(bu._SORTED_EQ)
+                        pf_counted = True
+                else:
+                    nb = 3 if a.street == Street.FLOP else 4 if a.street == Street.TURN else 5
+                    cat = bu.made_score(opp, result.board[:nb]) >> 20
+                    s["sd_post_n"] += 1
+                    s["sd_post_weak"] += cat <= _WEAK_CUT[nb]
+                    s["sd_post_base"] += _WEAK_BASE[nb]
     except Exception:
         pass
     finally:
