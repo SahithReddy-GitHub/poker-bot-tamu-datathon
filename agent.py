@@ -40,7 +40,7 @@ warmup()
 
 # rename as your team/bot's name
 PARTICIPANT = "Royal Flush"
-AGENT_NAME = "RangeEquityBot-v3"
+AGENT_NAME = "RangeEquityBot-v4"
 
 
 # ===== YOUR CODE HERE =====
@@ -87,11 +87,22 @@ P = {
     "river_call_margin": 0.05,  # extra equity needed to call on the river
     "check_strong_keep": 1.0,  # after opp checks, keep its strong hands with this prob
     "time_budget": TIME_BUDGET,  # seconds of our own compute per half
+    "budget_share": 0.6875,    # ... but at most this share of the judge's bank (5.5 of 8 s)
     "steal_ftr": 0.80,         # vs opponents folding this often to raises: raise everything
     "max_trials_fast": 3000,   # cap on numpy simulations per decision
     "use_ev_bluff": 1,         # bluff whenever the expected value says it pays
     "fold_prior": 0.2,        # assumed fold rate before we have data
     "called_eq_factor": 0.6,  # our equity is lower when a bet gets called
+    "implied_bonus": 0.0,      # draws: lower the call margin by up to this (implied odds)
+    "draw_max_cat": 1,         # ... when our made hand is at most this (1 = one pair)
+    "trap_prob": 0.0,          # out of position: check a monster this often to check-raise
+    "trap_eq": 0.80,           # ... with at least this equity
+    "trap_stab": 0.55,         # ... vs opponents who bet this often when checked to
+    "trap_min_n": 8,           # ... after seeing at least this many of their responses
+    "bet_half_eq_passive": 0.40,  # thinner value bets vs passive callers (tested: +0.7 bb/deal)
+    "passive_raise": 0.12,     # "passive" = raises at most this share of postflop actions
+    "passive_max_ftr": 0.35,   # ... and folds to our bets at most this often
+    "passive_min_n": 30,       # ... measured over at least this many actions
     "bluff_ev_margin": 0.06,   # bluff only if it beats checking by this share of the pot
     "raise_fold_discount": 0.5,  # opponents fold less to a raise after betting
     "sd_prior": 6,             # showdowns needed before trusting showdown stats half-way
@@ -186,6 +197,7 @@ def _equity(obs, memory, allowance):
         eq = _fe.equity(obs.hole_cards, obs.board, n, memory["nprng"], thresh, post_w, chk_keep)
         dt = time.perf_counter() - t0
         memory["tpt"] = 0.8 * memory["tpt"] + 0.2 * max(2e-7, dt / n)
+        memory["tpt_n"] += 1
         cache[key] = eq
         return eq
 
@@ -248,8 +260,12 @@ def _equity(obs, memory, allowance):
 
 
 def _allowance(obs, memory):
-    """Seconds we may spend on this decision, from what is left of our budget."""
-    left = P["time_budget"] - memory["t_used"]
+    """Seconds we may spend on this decision, from what is left of our budget.
+
+    The budget is about 69% of the judge's time bank (5.5 of 8 s), so over 2 s
+    stays in reserve for server overhead we can't measure. When the budget is
+    used up the allowance is zero and the bot plays by instant rules."""
+    left = memory["budget"] - memory["t_used"]
     hands_left = max(1, memory["num_hands"] - obs.hand_index)
     dph = max(1.2, memory["decisions"] / max(1, obs.hand_index + 1))
     per = left / (hands_left * dph)
@@ -277,6 +293,20 @@ def _fold_prob(memory, street):
     s = memory["stats"]
     overall = (s["fold_vs_raise"] + 4 * P["fold_prior"]) / (s["faced_raise"] + 4)
     return (s["fold_s"][street] + 6 * overall) / (s["faced_s"][street] + 6)
+
+
+def _stab_rate(memory):
+    """How often the opponent bets after we check to it postflop (prior 0.5)."""
+    s = memory["stats"]
+    return (s["chk_bet"] + 3) / (s["chk_n"] + 6)
+
+
+def _is_passive(memory):
+    """True for opponents that rarely bet or raise after the flop and rarely
+    fold to our bets (calling stations): they pay off thin value bets."""
+    s = memory["stats"]
+    return (s["post_act"] >= P["passive_min_n"] and s["post_raise"] / s["post_act"] <= P["passive_raise"]
+            and _stats(memory)[3] <= P["passive_max_ftr"])
 
 
 def _ev_bet(obs, memory, eq):
@@ -313,9 +343,51 @@ def _ev_raise(obs, memory, eq, call_ok):
     return best
 
 
+def _feature_equity(hole):
+    """Backup preflop strength from hand features, used only if the table
+    file is missing. Weights fitted to the table (rank correlation 0.96)."""
+    ranks = [c >> 2 for c in hole]
+    suits = [c & 3 for c in hole]
+    cnt = [ranks.count(r) for r in range(9)]
+    pair_val = sum(r + 1 for r in range(9) if cnt[r] == 2)   # higher pairs are better
+    n_pairs = sum(1 for r in range(9) if cnt[r] == 2)
+    trips = sum(1 for r in range(9) if cnt[r] >= 3)          # trips block our own outs
+    sc = sorted((suits.count(s) for s in range(4)), reverse=True)
+    double_suited = 1 if sc[1] >= 2 else 0
+    four_flush = 1 if sc[0] >= 4 else 0
+    rs = set(ranks) | ({-1} if 8 in ranks else set())       # ace also plays low
+    wrap = max(sum(1 for r in rs if lo <= r < lo + 5) for lo in range(-1, 5))  # connectivity
+    high = sum(1 for r in ranks if r >= 7)                   # kings and aces
+    return (0.2964 + 0.0053 * pair_val + 0.0278 * n_pairs - 0.0748 * trips + 0.0325 * double_suited
+            - 0.0298 * four_flush + 0.0029 * wrap - 0.0155 * high + 0.0081 * sum(ranks))
+
+
+_FEATURE_SORTED = []
+
+
+def _preflop_strength(hole):
+    """(equity vs a random hand, percentile among all hands) of 5 hole cards."""
+    if bu._SORTED_EQ:
+        pf_eq = bu.preflop_equity(hole)
+        return pf_eq, bisect_left(bu._SORTED_EQ, int(pf_eq * 65535)) / len(bu._SORTED_EQ)
+    if not _FEATURE_SORTED:
+        r = random.Random(5)
+        _FEATURE_SORTED.extend(sorted(_feature_equity(r.sample(range(36), 5)) for _ in range(3000)))
+    eq = _feature_equity(hole)
+    return eq, bisect_left(_FEATURE_SORTED, eq) / len(_FEATURE_SORTED)
+
+
 def _preflop(obs, memory, allowance):
-    pf_eq = bu.preflop_equity(obs.hole_cards)
-    pct = bisect_left(bu._SORTED_EQ, int(pf_eq * 65535)) / len(bu._SORTED_EQ) if bu._SORTED_EQ else 0.5
+    """Preflop tiers by percentile. The percentile comes from a table of every
+    hand's simulated equity, so pairs, suits, connectivity and high cards are
+    already priced in exactly.
+      Monster:     re-raise when equity vs the opponent's range >= pf_reraise_eq
+      Strong:      top 35% (bb_raise_pct): the big blind raises a limp
+      Playable:    top 60% (open_pct): the button opens with a pot raise
+      Speculative: top 88% (limp_pct): the button limps, cheap to see a flop
+      Trash:       the rest folds to any bet
+    Facing a raise, call when equity vs its range beats the pot odds."""
+    pf_eq, pct = _preflop_strength(obs.hole_cards)
     opp_raised = any((not a.is_me) and a.action in RAISES for a in obs.action_history)
     _, _, _, fold_to_raise, _, _ = _stats(memory)
 
@@ -356,10 +428,18 @@ def _postflop(obs, memory, allowance):
     river = obs.street == Street.RIVER
 
     if obs.to_call == 0:
+        # Trap: out of position with a monster against an opponent who bets
+        # when checked to. Check now, then raise its bet (see below).
+        if (P["trap_prob"] > 0 and not obs.is_button and eq >= P["trap_eq"]
+                and memory["stats"]["chk_n"] >= P["trap_min_n"]
+                and _stab_rate(memory) >= P["trap_stab"] and rng.random() < P["trap_prob"]):
+            return Action.CHECK_CALL
         ip = P["ip_bonus"] if obs.is_button else 0.0
         if eq >= P["bet_pot_eq"] - ip:
             return _pick(obs, Action.RAISE_POT)
-        if eq >= P["bet_half_eq"] - ip or (eq >= P["bet_half_eq_station"] - ip and fold_to_raise < 0.3):
+        # Passive opponents rarely raise us off our hand: value bet thinner.
+        half_eq = P["bet_half_eq_passive"] if _is_passive(memory) else P["bet_half_eq"]
+        if eq >= half_eq - ip or (eq >= P["bet_half_eq_station"] - ip and fold_to_raise < 0.3):
             return _pick(obs, Action.RAISE_HALF)
         if fold_to_raise >= P["steal_ftr"] and memory["stats"]["faced_raise"] >= 20:
             return _pick(obs, Action.RAISE_HALF)
@@ -382,6 +462,12 @@ def _postflop(obs, memory, allowance):
         margin = 0.0
     else:
         margin = P["river_call_margin"] if river else P["call_margin"]
+        # Implied odds: with a draw (weak made hand but good equity) we win
+        # extra bets when we hit, so we need a smaller margin to call.
+        if not river and P["implied_bonus"] > 0:
+            if (bu.made_score(obs.hole_cards, obs.board) >> 20) <= P["draw_max_cat"]:
+                behind = min(obs.my_stack - obs.to_call, obs.opp_stack)
+                margin -= P["implied_bonus"] * _clamp(behind / (obs.pot + obs.to_call), 0.0, 1.0)
     call_ok = eq >= odds + margin
     if P["use_ev_bluff"] and obs.raises_this_street < 3:
         a = _ev_raise(obs, memory, eq, call_ok)
@@ -392,6 +478,10 @@ def _postflop(obs, memory, allowance):
 
 def new_half(config: AgentConfig, memory: dict) -> None:
     memory["num_hands"] = getattr(config, "num_hands", 1000) or 1000
+    # Size our thinking budget from the bank the judge actually gives us.
+    memory["bank"] = float(getattr(config, "time_bank_seconds", 8.0) or 8.0)
+    memory["budget"] = min(P["time_budget"], memory["bank"] * P["budget_share"])
+    memory["tpt_n"] = 0
     memory["t_used"] = 0.0
     memory["decisions"] = 0
     memory["rng"] = random.Random(20261107)
@@ -399,7 +489,8 @@ def new_half(config: AgentConfig, memory: dict) -> None:
     memory["cur"] = None  # (hand_index, last history seen, my last action)
     memory["stats"] = {k: 0 for k in (
         "pf_act", "pf_raise", "pf_cont", "post_act", "post_raise",
-        "faced_raise", "fold_vs_raise", "sd_post_n", "sd_post_weak", "sd_pf_n", "sd_pf_pct")}
+        "faced_raise", "fold_vs_raise", "sd_post_n", "sd_post_weak", "sd_pf_n", "sd_pf_pct",
+        "chk_n", "chk_bet")}  # chk_*: opponent's replies when we check to it postflop
     memory["stats"]["sd_post_base"] = 0.0
     memory["stats"]["faced_s"] = [0, 0, 0, 0]   # our raises the opponent faced, per street
     memory["stats"]["fold_s"] = [0, 0, 0, 0]    # ... and folded to
@@ -427,7 +518,7 @@ def choose_action(obs: Observation, memory: dict) -> Action:
             action = _preflop(obs, memory, allowance)
         else:
             action = _postflop(obs, memory, allowance)
-        memory["cur"] = (obs.hand_index, obs.action_history, action, obs.street)
+        memory["cur"] = (obs.hand_index, obs.action_history, action, obs.street, obs.to_call)
     except Exception:
         action = None
     if action not in obs.legal_actions:
@@ -450,12 +541,22 @@ def on_hand_end(result: HandResult, memory: dict) -> None:
             if not result.went_to_showdown and result.my_net > 0:
                 s["pf_act"] += 1
             return
-        _, history, my_last, my_street = cur
+        _, history, my_last, my_street, my_to_call = cur
         prev_mine = None
+        prev_check_first = False  # our previous action was a check as first to act
+        seen_streets = set()
         for a in history:
+            first = a.street not in seen_streets
+            seen_streets.add(a.street)
             if a.is_me:
                 prev_mine = a.action
+                prev_check_first = (first and a.street != Street.PREFLOP
+                                    and a.action == Action.CHECK_CALL and a.amount == 0)
                 continue
+            if prev_check_first and not first:
+                s["chk_n"] += 1
+                s["chk_bet"] += a.action in RAISES
+            prev_check_first = False
             pre = a.street == Street.PREFLOP
             s["pf_act" if pre else "post_act"] += 1
             if a.action in RAISES:
@@ -467,6 +568,9 @@ def on_hand_end(result: HandResult, memory: dict) -> None:
                 s["faced_s"][int(a.street)] += 1
             prev_mine = None
         # The opponent's response to our last action, which we never saw.
+        if (my_last == Action.CHECK_CALL and my_to_call == 0 and my_street != Street.PREFLOP
+                and my_street not in seen_streets and result.went_to_showdown):
+            s["chk_n"] += 1  # we checked first and it checked behind
         if my_last in RAISES:
             s["faced_raise"] += 1
             s["faced_s"][int(my_street)] += 1
